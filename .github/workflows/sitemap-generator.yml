@@ -1,0 +1,40 @@
+name: Weekly Sitemap Update
+
+on:
+  schedule:
+    - cron: "0 0 * * 6" # Runs at midnight every Saturday
+  workflow_dispatch: # Allows manual triggering
+
+jobs:
+  update-sitemap:
+    name: Update Sitemap
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "16"
+          cache: "yarn"
+
+      - name: Install dependencies
+        run: yarn install
+
+      - name: Run postexport
+        run: yarn postexport
+
+      - name: Configure Git
+        run: |
+          git config --global user.name 'GitHub Action'
+          git config --global user.email 'action@github.com'
+
+      - name: Commit and push changes
+        run: |
+          git add .
+          git commit -m "chore: update sitemap [skip ci]"
+          git push

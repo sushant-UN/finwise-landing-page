@@ -1,0 +1,99 @@
+name: Lighthouse Comment Trigger
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  check-comment:
+    runs-on: ubuntu-latest
+    if: |
+      github.event.issue.pull_request &&
+      (contains(github.event.comment.body, '/lighthouse run') ||
+       contains(github.event.comment.body, '/lighthouse recheck') ||
+       contains(github.event.comment.body, '/recheck lighthouse') ||
+       contains(github.event.comment.body, '/lighthouse') && contains(github.event.comment.body, 'recheck'))
+
+    steps:
+      - name: React to comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Add reaction to show we received the command
+            github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: '+1'
+            });
+
+      - name: Get PR details
+        id: pr-details
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+
+            core.setOutput('pr_number', context.issue.number);
+            core.setOutput('head_ref', pr.data.head.ref);
+            core.setOutput('head_sha', pr.data.head.sha);
+            core.setOutput('base_ref', pr.data.base.ref);
+
+      - name: Check if user has permission
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: collaborators } = await github.rest.repos.listCollaborators({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+
+            const user = context.payload.comment.user.login;
+            const hasPermission = collaborators.some(collab => 
+              collab.login === user && ['admin', 'write'].includes(collab.permissions.admin ? 'admin' : collab.permissions.push ? 'write' : 'read')
+            );
+
+            if (!hasPermission) {
+              // Comment that user doesn't have permission
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `❌ Sorry @${user}, only collaborators with write access can trigger Lighthouse rechecks.`
+              });
+              core.setFailed('User does not have permission to trigger Lighthouse recheck');
+            }
+
+      - name: Trigger Lighthouse CI workflow
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Trigger the lighthouse workflow via repository dispatch
+            await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event_type: 'lighthouse-recheck',
+              client_payload: {
+                pr_number: context.issue.number,
+                ref: '${{ steps.pr-details.outputs.head_ref }}',
+                sha: '${{ steps.pr-details.outputs.head_sha }}',
+                triggered_by: context.payload.comment.user.login,
+                comment_id: context.payload.comment.id
+              }
+            });
+
+            // Comment to confirm trigger
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🚀 Lighthouse CI recheck triggered by @${context.payload.comment.user.login}! 
+              
+              You can monitor the progress in the [Actions tab](${context.payload.repository.html_url}/actions).
+              
+              Results will be posted here when complete.`
+            });

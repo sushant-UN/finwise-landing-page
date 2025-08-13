@@ -1,0 +1,257 @@
+name: Lighthouse CI
+
+on:
+  # Only manual triggering - no automatic runs on PR creation or pushes
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to check (optional - will use current branch if not specified)"
+        required: false
+        type: string
+      urls:
+        description: "Custom URLs to test (comma-separated, optional)"
+        required: false
+        type: string
+        default: "http://localhost:3000,"
+  # Allow triggering via repository dispatch (for comment triggers)
+  repository_dispatch:
+    types: [lighthouse-recheck]
+
+jobs:
+  lighthouse-ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set PR context for manual/dispatch triggers
+        id: pr-context
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ -n "${{ github.event.inputs.pr_number }}" ]]; then
+              echo "pr_number=${{ github.event.inputs.pr_number }}" >> $GITHUB_OUTPUT
+            else
+              # Try to find PR for current branch
+              PR_NUMBER=$(gh pr view --json number --jq '.number' 2>/dev/null || echo "")
+              echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+            fi
+          elif [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
+            echo "pr_number=${{ github.event.client_payload.pr_number }}" >> $GITHUB_OUTPUT
+          else
+            # Fallback - try to detect PR from current branch
+            PR_NUMBER=$(gh pr view --json number --jq '.number' 2>/dev/null || echo "")
+            echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update PR status - Starting
+        if: steps.pr-context.outputs.pr_number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = "${{ steps.pr-context.outputs.pr_number }}";
+            if (!prNumber) return;
+
+            // Get current PR description
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: parseInt(prNumber)
+            });
+
+            let description = pr.body || '';
+
+            // Create running status section
+            const newStatusSection = `**Lighthouse CI Status:** 🟡 Running...  
+
+            ### Run Performance Tests
+            🔄 Tests are currently running... [View Progress](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${{ github.run_id }})
+
+            **🔗 [▶️ Run Lighthouse CI Performance Tests](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/workflows/lighthouse-ci.yml)**
+
+            > **Alternative:** Comment \`/lighthouse run\` below to trigger the tests`;
+
+            // Replace the lighthouse status section
+            const statusRegex = /<!-- lighthouse-status:.*? -->[\s\S]*?<!-- lighthouse-status-end -->/;
+
+            if (statusRegex.test(description)) {
+              // Update existing status
+              const replacement = `<!-- lighthouse-status:running -->\n${newStatusSection}\n\n<!-- lighthouse-status-end -->`;
+              description = description.replace(statusRegex, replacement);
+            } else {
+              // Add status section if it doesn't exist
+              const performanceSection = `## 🚀 Performance Testing\n\n<!-- lighthouse-status:running -->\n${newStatusSection}\n\n<!-- lighthouse-status-end -->\n\n`;
+              description = performanceSection + description;
+            }
+
+            // Update PR description
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: parseInt(prNumber),
+              body: description
+            });
+
+            console.log(`Updated PR #${prNumber} - Lighthouse CI started`);
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # For manual/dispatch triggers, checkout the PR branch
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.ref || github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "yarn"
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Build application
+        run: yarn localbuild
+
+      - name: Run Lighthouse CI
+        run: yarn lhci:autorun
+        env:
+          LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Lighthouse results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lighthouse-results-${{ github.run_number }}
+          path: .lighthouseci/
+          retention-days: 30
+
+      - name: Comment PR with results and update status
+        if: steps.pr-context.outputs.pr_number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            try {
+              const prNumber = "${{ steps.pr-context.outputs.pr_number }}";
+              
+              // Read Lighthouse CI results
+              const resultsPath = '.lighthouseci/lhr-*.json';
+              const glob = require('glob');
+              const resultFiles = glob.sync(resultsPath);
+              
+              if (resultFiles.length === 0) {
+                console.log('No Lighthouse results found');
+                return;
+              }
+              
+              const results = resultFiles.map(file => 
+                JSON.parse(fs.readFileSync(file, 'utf8'))
+              );
+              
+              // Calculate average scores
+              const avgScores = results.reduce((acc, result) => {
+                const categories = result.categories;
+                Object.keys(categories).forEach(key => {
+                  if (!acc[key]) acc[key] = [];
+                  acc[key].push(categories[key].score);
+                });
+                return acc;
+              }, {});
+              
+              Object.keys(avgScores).forEach(key => {
+                avgScores[key] = Math.round(
+                  avgScores[key].reduce((a, b) => a + b, 0) / avgScores[key].length * 100
+                );
+              });
+              
+              // Determine overall status
+              const performanceScore = avgScores.performance || 0;
+              const overallStatus = performanceScore >= 90 ? 'success' : performanceScore >= 70 ? 'warning' : 'failed';
+              const statusIcon = overallStatus === 'success' ? '🟢' : overallStatus === 'warning' ? '🟡' : '🔴';
+              const statusText = overallStatus === 'success' ? 'Passed' : overallStatus === 'warning' ? 'Passed with Warnings' : 'Failed';
+              
+              // Determine trigger type for comment
+              const triggerType = "${{ github.event_name }}" === "workflow_dispatch" ? "🔄 Manual Recheck" :
+                                "${{ github.event_name }}" === "repository_dispatch" ? "🔄 Button/Comment Triggered" :
+                                "🚢 Automatic Check";
+              
+              // Create comment body
+              const commentBody = `## ${triggerType} - Lighthouse CI Results
+              
+              **Run #${{ github.run_number }}** | **Commit:** \`${context.sha.substring(0, 7)}\` | **Status:** ${statusIcon} ${statusText}
+              
+              | Category | Score |
+              |----------|-------|
+              | Performance | ${avgScores.performance || 'N/A'}% |
+              | Accessibility | ${avgScores.accessibility || 'N/A'}% |
+              | Best Practices | ${avgScores['best-practices'] || 'N/A'}% |
+              | SEO | ${avgScores.seo || 'N/A'}% |
+              
+              ### Core Web Vitals
+              ${results.map((result, index) => {
+                const audits = result.audits;
+                return `**Run ${index + 1}:**
+              - LCP: ${Math.round(audits['largest-contentful-paint'].numericValue)}ms
+              - FCP: ${Math.round(audits['first-contentful-paint'].numericValue)}ms
+              - CLS: ${audits['cumulative-layout-shift'].numericValue.toFixed(3)}
+              - TBT: ${Math.round(audits['total-blocking-time'].numericValue)}ms`;
+              }).join('\n\n')}
+              
+              ---
+              > 💡 **Tip:** Comment \`/lighthouse run\` to run Lighthouse CI again  
+              > � **Details:** [View full report](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${{ github.run_id }})`;
+              
+              // Post comment
+              if (prNumber) {
+                await github.rest.issues.createComment({
+                  issue_number: parseInt(prNumber),
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: commentBody
+                });
+              }
+              
+              // Update PR description with final status
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: parseInt(prNumber)
+              });
+              
+              let description = pr.body || '';
+              
+              // Create completed status section
+              const newStatusSection = `**Lighthouse CI Status:** ${statusIcon} ${statusText}  
+              
+              ### Run Performance Tests
+              **📊 [View Latest Results](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${{ github.run_id }})** | Performance Score: **${performanceScore}%**
+              
+              **🔗 [▶️ Run Lighthouse CI Performance Tests](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/workflows/lighthouse-ci.yml)**
+              
+              > **Alternative:** Comment \`/lighthouse run\` below to trigger the tests`;
+              
+              // Replace the lighthouse status section
+              const statusRegex = /<!-- lighthouse-status:.*? -->[\s\S]*?<!-- lighthouse-status-end -->/;
+              
+              if (statusRegex.test(description)) {
+                // Update existing status
+                const replacement = `<!-- lighthouse-status:${overallStatus} -->\n${newStatusSection}\n\n<!-- lighthouse-status-end -->`;
+                description = description.replace(statusRegex, replacement);
+                
+                // Update PR description
+                await github.rest.pulls.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: parseInt(prNumber),
+                  body: description
+                });
+                
+                console.log(`Updated PR #${prNumber} with final Lighthouse status: ${statusText}`);
+              }
+              
+            } catch (error) {
+              console.log('Error processing Lighthouse results:', error);
+            }
